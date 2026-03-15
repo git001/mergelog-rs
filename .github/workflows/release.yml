@@ -77,8 +77,9 @@ jobs:
         run: sudo apt-get update --yes && sudo apt-get install --yes musl-tools
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.94"
           targets: ${{ matrix.target }}
 
       - name: Install cross
