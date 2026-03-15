@@ -1,0 +1,27 @@
+[package]
+name = "mergelog-rs"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Merge and sort HTTP log files chronologically – Rust rewrite of mergelog 4.5"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "mergelog-rs"
+path = "src/main.rs"
+
+[dependencies]
+anyhow   = "1.0.102"
+bzip2    = "0.5"
+clap     = { version = "4.6.0", features = ["derive"] }
+flate2   = "1.1.9"
+memchr   = "2"
+mimalloc = { version = "0.1", default-features = false }
+xz2      = "0.1"
+zstd     = "0.13"
+
+[profile.release]
+opt-level = 3
+lto       = true
+codegen-units = 1
+strip     = true

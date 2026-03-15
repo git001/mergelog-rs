@@ -1,0 +1,7 @@
+/target/
+/test-data/*.log
+/test-data/*.log.gz
+/test-data/*.log.bz2
+/test-data/*.log.xz
+/:/
+PROGRESS.md
