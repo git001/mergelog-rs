@@ -5,81 +5,9 @@ use std::io::{BufRead, Write};
 use anyhow::Result;
 use memchr::memchr;
 
-use crate::parser::{parse_clf_timestamp, sentinel, ts_to_string};
-
-// ---------------------------------------------------------------------------
-// Statistics
-// ---------------------------------------------------------------------------
-
-/// Per-file merge statistics.
-pub struct FileStats {
-    pub lines:     u64,
-    pub malformed: u64,
-    pub first_ts:  i64,   // i64::MAX if no valid timestamp seen
-    pub last_ts:   i64,   // i64::MIN if no valid timestamp seen
-}
-
-impl FileStats {
-    fn new() -> Self {
-        Self { lines: 0, malformed: 0, first_ts: i64::MAX, last_ts: i64::MIN }
-    }
-    fn record(&mut self, ts: i64) {
-        self.lines += 1;
-        if ts == i64::MAX {
-            self.malformed += 1;
-        } else {
-            if ts < self.first_ts { self.first_ts = ts; }
-            if ts > self.last_ts  { self.last_ts  = ts; }
-        }
-    }
-}
-
-/// Aggregate statistics returned by `merge()`.
-pub struct MergeStats {
-    pub per_file: Vec<FileStats>,
-}
-
-impl MergeStats {
-    pub fn total_lines(&self)     -> u64 { self.per_file.iter().map(|f| f.lines).sum() }
-    pub fn total_malformed(&self) -> u64 { self.per_file.iter().map(|f| f.malformed).sum() }
-    pub fn first_ts(&self)        -> i64 { self.per_file.iter().map(|f| f.first_ts).min().unwrap_or(i64::MAX) }
-    pub fn last_ts(&self)         -> i64 { self.per_file.iter().map(|f| f.last_ts).max().unwrap_or(i64::MIN) }
-
-    /// Print a formatted summary to stderr.
-    pub fn print(&self, file_names: &[std::path::PathBuf]) {
-        let total   = self.total_lines();
-        let bad     = self.total_malformed();
-        let width   = file_names.iter().map(|p| p.display().to_string().len()).max().unwrap_or(0);
-
-        eprintln!("──── merge statistics ──────────────────────────────────────");
-        eprintln!("  Files    : {}", self.per_file.len());
-        eprintln!("  Lines    : {}  ({} malformed)", fmt_u64(total), fmt_u64(bad));
-        eprintln!("  Range    : {} → {}", ts_to_string(self.first_ts()), ts_to_string(self.last_ts()));
-        eprintln!("────────────────────────────────────────────────────────────");
-        for (f, name) in self.per_file.iter().zip(file_names) {
-            eprintln!(
-                "  {:<width$}  {:>12} lines  {} → {}{}",
-                name.display(),
-                fmt_u64(f.lines),
-                ts_to_string(f.first_ts),
-                ts_to_string(f.last_ts),
-                if f.malformed > 0 { format!("  ({} malformed)", fmt_u64(f.malformed)) } else { String::new() },
-            );
-        }
-        eprintln!("────────────────────────────────────────────────────────────");
-    }
-}
-
-fn fmt_u64(n: u64) -> String {
-    // Insert thousands separators for readability.
-    let s = n.to_string();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 { out.push(','); }
-        out.push(c);
-    }
-    out.chars().rev().collect()
-}
+use crate::caddy;
+use crate::parser::{parse_clf_timestamp, sentinel};
+use crate::stats::{FileStats, MergeStats};
 
 // ---------------------------------------------------------------------------
 // Heap entry
@@ -106,6 +34,7 @@ impl PartialOrd for Entry {
     }
 }
 
+/// Min-heap by timestamp; tie-break by file index to preserve input order.
 impl Ord for Entry {
     fn cmp(&self, other: &Self) -> Ordering {
         other
@@ -116,47 +45,71 @@ impl Ord for Entry {
 }
 
 // ---------------------------------------------------------------------------
-// Public merge function
+// Public API
 // ---------------------------------------------------------------------------
+
+/// Format override passed from the CLI.
+///
+/// - `None`        — auto-detect per file (first char `{` → Caddy, else CLF)
+/// - `Some(true)`  — force all files to Caddy JSON
+/// - `Some(false)` — force all files to CLF (disables Caddy auto-detection)
+pub type ForceFormat = Option<bool>;
 
 /// Merge all `readers` into `out` in chronological order.
 ///
-/// Lines whose timestamp cannot be parsed are sorted to the end
-/// (sentinel = i64::MAX), matching the behaviour of mergelog 4.5.
+/// Caddy JSON lines are converted to CLF on the fly. Lines whose timestamp
+/// cannot be parsed sort to the end (sentinel = i64::MAX).
 /// Returns `MergeStats` with per-file line counts and time ranges.
 pub fn merge(
     readers: Vec<(usize, Box<dyn BufRead + Send>)>,
     out: &mut impl Write,
     progress: bool,
+    force_format: ForceFormat,
 ) -> Result<MergeStats> {
     let n_files = readers.len();
     let mut stats: Vec<FileStats> = (0..n_files).map(|_| FileStats::new()).collect();
     let mut heap: BinaryHeap<Entry> = BinaryHeap::with_capacity(n_files);
+    let mut file_is_caddy: Vec<bool> = vec![false; n_files];
 
-    // Seed the heap with the first non-empty line of each file.
+    // Seed the heap with the first parseable line of each file.
     for (file_idx, mut reader) in readers {
-        let mut line = String::with_capacity(512);
-        if fill_line(&mut *reader, &mut line)? {
-            let ts = parse_clf_timestamp(&line).unwrap_or_else(sentinel);
-            heap.push(Entry { ts, file_idx, line, reader });
+        let is_caddy = detect_format(&mut *reader, force_format)?;
+        file_is_caddy[file_idx] = is_caddy;
+        if let Some((ts, line)) = next_entry(&mut *reader, is_caddy)? {
+            stats[file_idx].record(ts);
+            heap.push(Entry {
+                ts,
+                file_idx,
+                line,
+                reader,
+            });
         }
     }
 
     let mut count: u64 = 0;
 
-    while let Some(Entry { mut line, mut reader, file_idx, ts }) = heap.pop() {
+    while let Some(Entry {
+        line,
+        mut reader,
+        file_idx,
+        ts: _,
+    }) = heap.pop()
+    {
         out.write_all(line.as_bytes())?;
-        stats[file_idx].record(ts);
 
-        line.clear();
-        if fill_line(&mut *reader, &mut line)? {
-            let ts = parse_clf_timestamp(&line).unwrap_or_else(sentinel);
-            heap.push(Entry { ts, file_idx, line, reader });
+        if let Some((ts, line)) = next_entry(&mut *reader, file_is_caddy[file_idx])? {
+            stats[file_idx].record(ts);
+            heap.push(Entry {
+                ts,
+                file_idx,
+                line,
+                reader,
+            });
         }
 
         if progress {
             count += 1;
-            if count % 10_000 == 0 {
+            if count.is_multiple_of(10_000) {
                 eprint!("\r{count} lines merged…");
             }
         }
@@ -170,10 +123,58 @@ pub fn merge(
 }
 
 // ---------------------------------------------------------------------------
-// Line reader
+// Format detection
 // ---------------------------------------------------------------------------
 
-/// Read one non-empty line into `buf` (which must already be cleared).
+/// Peek at the first non-whitespace byte to decide whether a file is Caddy
+/// JSON (`{`) or CLF. Does not consume any bytes.
+fn detect_format(reader: &mut dyn BufRead, force: ForceFormat) -> Result<bool> {
+    match force {
+        Some(forced) => Ok(forced),
+        None => {
+            let buf = reader.fill_buf()?;
+            Ok(buf
+                .iter()
+                .find(|&&b| !b.is_ascii_whitespace())
+                .map(|&b| b == b'{')
+                .unwrap_or(false))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Line reading
+// ---------------------------------------------------------------------------
+
+/// Read the next output-worthy line from `reader`.
+///
+/// CLF: every line is returned; malformed lines get the sentinel timestamp
+/// so they sort to the end.
+///
+/// Caddy JSON: non-access-log entries (no `request` field, e.g. error/debug
+/// messages) are skipped silently. Access entries are returned as CLF strings.
+///
+/// Returns `(unix_ts, output_line)` or `None` on EOF.
+fn next_entry(reader: &mut dyn BufRead, is_caddy: bool) -> Result<Option<(i64, String)>> {
+    let mut buf = String::with_capacity(512);
+    loop {
+        buf.clear();
+        if !fill_line(reader, &mut buf)? {
+            return Ok(None);
+        }
+        if is_caddy {
+            if let Some((ts, clf)) = caddy::parse_caddy_line(&buf) {
+                return Ok(Some((ts, clf)));
+            }
+            // Non-request line (error/info/debug) — skip.
+        } else {
+            let ts = parse_clf_timestamp(&buf).unwrap_or_else(sentinel);
+            return Ok(Some((ts, buf)));
+        }
+    }
+}
+
+/// Read one non-empty line into `buf` (caller must clear it first).
 /// Uses `fill_buf` + `memchr` for SIMD-accelerated newline search.
 /// Returns `true` if a line was read, `false` on EOF.
 #[inline]
@@ -186,9 +187,8 @@ fn fill_line(reader: &mut dyn BufRead, buf: &mut String) -> Result<bool> {
         match memchr(b'\n', available) {
             Some(pos) => {
                 let end = pos + 1;
-                let s = std::str::from_utf8(&available[..end]).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                })?;
+                let s = std::str::from_utf8(&available[..end])
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                 buf.push_str(s);
                 reader.consume(end);
                 if buf.trim_end_matches(['\n', '\r']).is_empty() {
@@ -198,14 +198,17 @@ fn fill_line(reader: &mut dyn BufRead, buf: &mut String) -> Result<bool> {
                 return Ok(true);
             }
             None => {
-                // No newline in buffer — consume all and loop for more.
+                // No newline in buffer yet — consume all and loop for more.
                 let len = available.len();
-                let s = std::str::from_utf8(available).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-                })?;
+                let s = std::str::from_utf8(available)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                 buf.push_str(s);
                 reader.consume(len);
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "merge_tests.rs"]
+mod tests;

@@ -1,6 +1,8 @@
+mod caddy;
 mod merge;
 mod parser;
 mod reader;
+mod stats;
 
 use mimalloc::MiMalloc;
 #[global_allocator]
@@ -50,6 +52,8 @@ struct Cli {
 enum Format {
     /// Apache / nginx Combined Log Format  [DD/Mon/YYYY:HH:MM:SS ±HHMM]
     Clf,
+    /// Caddy JSON access log (auto-detected when first char is '{')
+    Caddy,
 }
 
 // ---------------------------------------------------------------------------
@@ -67,22 +71,25 @@ fn main() -> Result<()> {
         .map(|(idx, path)| reader::open(path).map(|r| (idx, r)))
         .collect::<Result<_>>()?;
 
-    // Note: Format::Nginx uses the same parser as Clf.
-    // The flag is kept for future extensibility.
-    let _ = cli.format;
+    // None = auto-detect per file; Some(true/false) = force format.
+    // --format clf (default) keeps auto-detection; --format caddy forces Caddy.
+    let force_format: merge::ForceFormat = match cli.format {
+        Format::Caddy => Some(true),
+        Format::Clf => None, // auto-detect: CLF lines never start with '{'
+    };
 
     // Set up output: either a file or buffered stdout.
     let stats = if let Some(out_path) = cli.output {
         let file = std::fs::File::create(&out_path)
             .with_context(|| format!("cannot create {}", out_path.display()))?;
         let mut out = BufWriter::new(file);
-        let s = merge::merge(readers, &mut out, cli.progress)?;
+        let s = merge::merge(readers, &mut out, cli.progress, force_format)?;
         out.flush()?;
         s
     } else {
         let stdout = io::stdout();
         let mut out = BufWriter::new(stdout.lock());
-        let s = merge::merge(readers, &mut out, cli.progress)?;
+        let s = merge::merge(readers, &mut out, cli.progress, force_format)?;
         out.flush()?;
         s
     };

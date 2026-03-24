@@ -11,7 +11,13 @@ use zstd::stream::read::Decoder as ZstdDecoder;
 /// Read buffer: 4 MiB reduces syscall count vs the former 256 KiB.
 pub const READER_BUF: usize = 4 * 1024 * 1024;
 
-pub enum Compression { None, Gz, Bz2, Xz, Zstd }
+pub enum Compression {
+    None,
+    Gz,
+    Bz2,
+    Xz,
+    Zstd,
+}
 
 /// Detect compression from the first bytes of a byte slice (magic numbers).
 pub fn detect_from_bytes(magic: &[u8]) -> Compression {
@@ -46,8 +52,7 @@ pub fn open(path: &Path) -> Result<Box<dyn BufRead + Send>> {
         return open_stdin();
     }
 
-    let mut file = File::open(path)
-        .with_context(|| format!("cannot open {}", path.display()))?;
+    let mut file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
 
     Ok(match detect_file(&mut file)? {
         Compression::Gz => {
@@ -72,6 +77,54 @@ pub fn open(path: &Path) -> Result<Box<dyn BufRead + Send>> {
     })
 }
 
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_gz() {
+        assert!(matches!(
+            detect_from_bytes(&[0x1f, 0x8b, 0x00]),
+            Compression::Gz
+        ));
+    }
+    #[test]
+    fn detects_bz2() {
+        assert!(matches!(
+            detect_from_bytes(&[0x42, 0x5a, 0x68]),
+            Compression::Bz2
+        ));
+    }
+    #[test]
+    fn detects_xz() {
+        assert!(matches!(
+            detect_from_bytes(&[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]),
+            Compression::Xz
+        ));
+    }
+    #[test]
+    fn detects_zstd() {
+        assert!(matches!(
+            detect_from_bytes(&[0x28, 0xb5, 0x2f, 0xfd]),
+            Compression::Zstd
+        ));
+    }
+    #[test]
+    fn detects_plain() {
+        assert!(matches!(
+            detect_from_bytes(b"1.2.3.4 - -"),
+            Compression::None
+        ));
+    }
+    #[test]
+    fn detects_plain_for_short_input() {
+        assert!(matches!(detect_from_bytes(&[0x1f]), Compression::None));
+        assert!(matches!(detect_from_bytes(&[]), Compression::None));
+    }
+}
+
 /// Open stdin as a buffered reader, auto-detecting compression via peek.
 fn open_stdin() -> Result<Box<dyn BufRead + Send>> {
     let mut reader = BufReader::with_capacity(READER_BUF, std::io::stdin());
@@ -84,9 +137,9 @@ fn open_stdin() -> Result<Box<dyn BufRead + Send>> {
     };
 
     Ok(match compression {
-        Compression::Gz   => Box::new(BufReader::with_capacity(READER_BUF, GzDecoder::new(reader))),
-        Compression::Bz2  => Box::new(BufReader::with_capacity(READER_BUF, BzDecoder::new(reader))),
-        Compression::Xz   => Box::new(BufReader::with_capacity(READER_BUF, XzDecoder::new(reader))),
+        Compression::Gz => Box::new(BufReader::with_capacity(READER_BUF, GzDecoder::new(reader))),
+        Compression::Bz2 => Box::new(BufReader::with_capacity(READER_BUF, BzDecoder::new(reader))),
+        Compression::Xz => Box::new(BufReader::with_capacity(READER_BUF, XzDecoder::new(reader))),
         Compression::Zstd => {
             let dec = ZstdDecoder::new(reader).context("cannot init zstd decoder for stdin")?;
             Box::new(BufReader::with_capacity(READER_BUF, dec))
