@@ -1,6 +1,6 @@
 [package]
 name = "mergelog-rs"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.94"
 description = "Merge and sort HTTP log files chronologically – Rust rewrite of mergelog 4.5"
