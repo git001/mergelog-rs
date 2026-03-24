@@ -5,9 +5,9 @@
 Merge and sort HTTP log files chronologically — Rust rewrite of
 [mergelog 4.5](https://mergelog.sourceforge.net/) by Bertrand Demiddelaer.
 
-Reads multiple Apache / nginx access log files in **NCSA Combined Log Format**
-and writes a single chronologically sorted stream to stdout. Designed for
-consolidating logs from multiple servers behind a round-robin DNS.
+Reads multiple HTTP access log files (**NCSA Combined Log Format** and **Caddy
+JSON**) and writes a single chronologically sorted CLF stream to stdout.
+Designed for consolidating logs from multiple servers behind a round-robin DNS.
 
 > Full background and benchmarks: **[Alek's Blog — mergelog-rs](https://blog.none.at/blog/2026/2026-03-15-mergelog-rs/)**
 
@@ -15,6 +15,8 @@ consolidating logs from multiple servers behind a round-robin DNS.
 
 ## Features
 
+- **Caddy JSON support** — auto-detects Caddy JSON access logs per file and converts them to CLF on the fly
+- **Mixed input** — CLF and Caddy JSON files can be merged in a single run; format is detected per file
 - **Auto-detect compression** via magic bytes — gzip, bzip2, xz, zstd, and plain text, no file extension needed
 - **Timezone-aware** — timestamps are converted to UTC before comparison; logs from servers in different timezones sort correctly
 - **O(N log K) k-way heap merge** — scales with the number of lines, not the time span of the logs
@@ -93,30 +95,36 @@ mergelog-rs [OPTIONS] <FILE>...
 | `--progress` | Print running line count to stderr every 10,000 lines. |
 | `--stats` | Print per-file statistics to stderr after the merge. |
 | `-o, --output <FILE>` | Write to a file instead of stdout. |
-| `--format <FORMAT>` | Log format (`clf`, default). |
+| `--format <FORMAT>` | Force log format: `clf` or `caddy`. Default: auto-detect per file. |
 | `-h, --help` | Print help. |
 | `-V, --version` | Print version. |
 
 ### Examples
 
 ```sh
-# Merge plain-text log files
+# Merge CLF log files
 mergelog-rs access1.log access2.log access3.log > merged.log
 
-# Merge compressed files — format auto-detected via magic bytes
+# Merge Caddy JSON logs (auto-detected, output is CLF)
+mergelog-rs caddy1.log caddy2.log > merged.log
+
+# Mix CLF and Caddy JSON — format detected per file
+mergelog-rs nginx.log caddy.log > merged.log
+
+# Force Caddy format for all files (e.g. multiple pods)
+mergelog-rs --format caddy pod1.log pod2.log > merged.log
+
+# Merge compressed files — compression auto-detected via magic bytes
 mergelog-rs access.log.gz archive.log.bz2 old.log.xz backup.log.zst > merged.log
 
-# Mix compressed and plain
-mergelog-rs current.log archive.log.gz > merged.log
-
 # Read from stdin (e.g. over SSH), merge with a local file
-ssh web01 "cat /var/log/nginx/access.log" | mergelog-rs - /var/log/nginx/access.log
+ssh web01 "cat /var/log/caddy/access.log" | mergelog-rs - /var/log/caddy/access.log
 
 # Write to a file and show statistics
 mergelog-rs --stats -o merged.log access1.log access2.log
 
 # Run in a container
-podman run --rm -v /var/log/nginx:/logs:ro ghcr.io/git001/mergelog-rs \
+podman run --rm -v /var/log/caddy:/logs:ro ghcr.io/git001/mergelog-rs \
   /logs/access1.log /logs/access2.log > merged.log
 ```
 
@@ -192,9 +200,11 @@ Key optimizations over a naive Rust port:
 
 ---
 
-## Log Format
+## Log Formats
 
-NCSA Combined Log Format (`%h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-agent}i"`):
+### CLF — NCSA Combined Log Format
+
+`%h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-agent}i"` — produced by Apache, nginx, and others:
 
 ```
 93.184.216.34 - alice [15/Mar/2026:12:00:00 +0100] "GET / HTTP/1.1" 200 4096 "https://example.com/" "Mozilla/5.0"
@@ -202,6 +212,17 @@ NCSA Combined Log Format (`%h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-agent}i
 
 See the [Apache mod_log_config documentation](https://httpd.apache.org/docs/2.4/mod/mod_log_config.html)
 for the full format reference.
+
+### Caddy JSON
+
+One JSON object per line, as written by Caddy's `json` log encoder:
+
+```json
+{"ts":"2026-03-22T14:50:51.525Z","request":{"client_ip":"1.2.3.4","method":"GET","uri":"/","proto":"HTTP/1.1","headers":{"User-Agent":["Mozilla/5.0"]}},"status":200,"size":4096,"user_id":""}
+```
+
+The `ts` field may be an ISO 8601 string or a Unix float. Non-request lines
+(error/info/debug entries) are skipped silently. Output is always CLF.
 
 ---
 
